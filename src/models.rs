@@ -1,4 +1,7 @@
 mod backoff_function;
+mod handler_execution_mode;
+mod incoming_message;
+mod message_delete_mode;
 mod queue;
 mod resource_name;
 mod resource_naming_options;
@@ -8,6 +11,9 @@ mod sns_topic_attribute;
 mod topic;
 
 pub use backoff_function::BackoffFunction;
+pub use handler_execution_mode::HandlerExecutionMode;
+pub use incoming_message::IncomingMessage;
+pub use message_delete_mode::MessageDeleteMode;
 pub use queue::Queue;
 pub use resource_name::ResourceName;
 pub use resource_naming_options::ResourceNamingOptions;
