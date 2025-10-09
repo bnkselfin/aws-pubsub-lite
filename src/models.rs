@@ -1,4 +1,5 @@
 mod backoff_function;
+mod base_message_handler;
 mod handler_execution_mode;
 mod incoming_message;
 mod message_delete_mode;
@@ -11,6 +12,7 @@ mod sns_topic_attribute;
 mod topic;
 
 pub use backoff_function::BackoffFunction;
+pub use base_message_handler::BaseMessageHandler;
 pub use handler_execution_mode::HandlerExecutionMode;
 pub use incoming_message::IncomingMessage;
 pub use message_delete_mode::MessageDeleteMode;
