@@ -5,7 +5,7 @@ use crate::models::SnsTopicAttribute;
 use crate::models::Topic;
 use crate::settings::{QueueSettings, TopicSettings};
 use aws_config::SdkConfig;
-use aws_sdk_sns::Client as SnsClient;
+use aws_sdk_sns::{Client as SnsClient, operation::publish::PublishOutput};
 use aws_sdk_sqs::{Client as SqsClient, types::QueueAttributeName};
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -253,6 +253,41 @@ impl PubSub {
             })?;
         tracing::info!("Succeeded to set queue attributes");
         Ok(())
+    }
+
+    #[tracing::instrument(name = "PubSub::publish", skip(self, msg), fields(msg_len = msg.len()))]
+    pub async fn publish(&self, topic_name: &str, msg: &str) -> Result<PublishOutput, PubSubError> {
+        if msg.is_empty() {
+            return Err(PubSubError::EmptyMessage);
+        }
+
+        let topic_arn = {
+            let topics = self
+                .topics
+                .read()
+                .map_err(|_| PubSubError::LockPoisoned { resource: "topics" })?;
+            topics
+                .get(topic_name)
+                .ok_or_else(|| PubSubError::TopicNotExists(topic_name.to_string()))?
+                .arn()
+                .to_string()
+        };
+
+        let publish_output: PublishOutput = self
+            .sns_client
+            .publish()
+            .topic_arn(topic_arn)
+            .message(msg)
+            .send()
+            .await
+            .map_err(|e| PubSubError::PublishMessage {
+                topic: topic_name.to_string(),
+                message: msg.into(),
+                source: e,
+            })?;
+
+        tracing::info!("Successfully pushed the message to the topic");
+        Ok(publish_output)
     }
 
     fn queue_settings(&self, context: &'static str) -> Result<QueueSettings, PubSubError> {
