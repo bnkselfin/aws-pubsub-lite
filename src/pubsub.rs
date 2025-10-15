@@ -255,6 +255,70 @@ impl PubSub {
         Ok(())
     }
 
+    #[tracing::instrument(name = "PubSub::ensure_subscription", skip(self))]
+    async fn ensure_subscription(
+        &self,
+        topic_arn: &str,
+        queue_arn: &str,
+    ) -> Result<(), PubSubError> {
+        let mut next_token: Option<String> = None;
+        loop {
+            let mut request = self
+                .sns_client
+                .list_subscriptions_by_topic()
+                .topic_arn(topic_arn);
+            if let Some(token) = next_token.as_deref() {
+                request = request.next_token(token);
+            }
+
+            let response = request.send().await.map_err(|e| {
+                tracing::error!(source = %e, "Failed to list SNS subscriptions");
+                PubSubError::ListingSubscriptions {
+                    topic: topic_arn.to_string(),
+                    source: e,
+                }
+            })?;
+
+            for subscription in response.subscriptions() {
+                if subscription.protocol() == Some("sqs")
+                    && subscription.endpoint() == Some(queue_arn)
+                {
+                    tracing::info!(
+                        topic = topic_arn,
+                        queue = queue_arn,
+                        "Subscription already exists, skipping Subscribe"
+                    );
+                    return Ok(());
+                }
+            }
+
+            match response.next_token() {
+                Some(token) => next_token = Some(token.to_string()),
+                None => break,
+            }
+        }
+
+        self.sns_client
+            .subscribe()
+            .topic_arn(topic_arn)
+            .protocol("sqs")
+            .endpoint(queue_arn)
+            .send()
+            .await
+            .map_err(|e| PubSubError::SubscribingQueue {
+                topic: topic_arn.to_string(),
+                queue_arn: queue_arn.to_string(),
+                source: e,
+            })?;
+
+        tracing::info!(
+            topic = topic_arn,
+            queue = queue_arn,
+            "Created new SNS subscription"
+        );
+        Ok(())
+    }
+
     #[tracing::instrument(name = "PubSub::publish", skip(self, msg), fields(msg_len = msg.len()))]
     pub async fn publish(&self, topic_name: &str, msg: &str) -> Result<PublishOutput, PubSubError> {
         if msg.is_empty() {
