@@ -1,4 +1,5 @@
 use crate::errors::PubSubError;
+use crate::models::IncomingMessage;
 use crate::models::Queue;
 use crate::models::ResourceName;
 use crate::models::SnsTopicAttribute;
@@ -7,10 +8,13 @@ use crate::settings::{QueueSettings, TopicSettings};
 use aws_config::SdkConfig;
 use aws_sdk_sns::{Client as SnsClient, operation::publish::PublishOutput};
 use aws_sdk_sqs::{Client as SqsClient, types::QueueAttributeName};
+use futures::{Stream, stream};
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::{Mutex, RwLock};
 use std::time::Duration;
+use std::{collections::VecDeque};
+use tokio_retry::{Retry, strategy::ExponentialBackoff};
 
 #[derive(Debug)]
 pub struct PubSub {
@@ -352,6 +356,67 @@ impl PubSub {
 
         tracing::info!("Successfully pushed the message to the topic");
         Ok(publish_output)
+    }
+
+    fn poll_sqs_stream(
+        &self,
+        sqs_url: &str,
+        queue_settings: QueueSettings,
+    ) -> impl Stream<Item = Result<IncomingMessage, PubSubError>> {
+        stream::unfold(VecDeque::new(), move |mut buffer| {
+            let qs = queue_settings.clone();
+            async move {
+                if let Some(msg) = buffer.pop_front() {
+                    return Some((Ok(msg), buffer));
+                }
+
+                loop {
+                    let retry_strategy =
+                        ExponentialBackoff::from_millis(qs.retry_interval_ms).take(qs.retry_count);
+
+                    match Retry::spawn(retry_strategy, || async {
+                        self.sqs_client
+                            .receive_message()
+                            .queue_url(sqs_url)
+                            .max_number_of_messages(qs.max_message_count as i32)
+                            .wait_time_seconds(qs.wait_time_seconds)
+                            .send()
+                            .await
+                    })
+                    .await
+                    {
+                        Ok(resp) => {
+                            if let Some(messages) = resp.messages {
+                                let count = messages.len();
+                                tracing::debug!(count, "Messages pulled from the queue");
+                                for msg in messages {
+                                    if let Some((body, receipt_handle)) =
+                                        msg.body.zip(msg.receipt_handle)
+                                    {
+                                        let incoming_message =
+                                            IncomingMessage::new(body, receipt_handle);
+                                        buffer.push_back(incoming_message);
+                                    }
+                                }
+                            }
+
+                            if let Some(msg) = buffer.pop_front() {
+                                return Some((Ok(msg), buffer));
+                            }
+                        }
+                        Err(e) => {
+                            return Some((
+                                Err(PubSubError::PollingQueue {
+                                    queue: sqs_url.to_string(),
+                                    source: e,
+                                }),
+                                buffer,
+                            ));
+                        }
+                    }
+                }
+            }
+        })
     }
 
     fn queue_settings(&self, context: &'static str) -> Result<QueueSettings, PubSubError> {
