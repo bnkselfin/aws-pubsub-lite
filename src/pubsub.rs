@@ -1,4 +1,7 @@
+use crate::errors::HandlerError;
 use crate::errors::PubSubError;
+use crate::models::BaseMessageHandler;
+use crate::models::HandlerExecutionMode;
 use crate::models::IncomingMessage;
 use crate::models::Queue;
 use crate::models::ResourceName;
@@ -8,13 +11,16 @@ use crate::settings::{QueueSettings, TopicSettings};
 use aws_config::SdkConfig;
 use aws_sdk_sns::{Client as SnsClient, operation::publish::PublishOutput};
 use aws_sdk_sqs::{Client as SqsClient, types::QueueAttributeName};
+use futures::StreamExt;
 use futures::{Stream, stream};
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::{Mutex, RwLock};
 use std::time::Duration;
 use std::{collections::VecDeque};
+use tokio::task::JoinSet;
 use tokio_retry::{Retry, strategy::ExponentialBackoff};
+use tokio_util::sync::CancellationToken;
 
 #[derive(Debug)]
 pub struct PubSub {
@@ -356,6 +362,155 @@ impl PubSub {
 
         tracing::info!("Successfully pushed the message to the topic");
         Ok(publish_output)
+    }
+
+    #[tracing::instrument(name = "pubsub::subscribe", skip(self, queue_name, handlers, cancellation_token), fields(queue = %queue_name, subscribers = handlers
+        .iter()
+        .map(|h| h.handler_name())
+        .collect::<Vec<_>>()
+        .join(", "), subscriber_count = handlers.len()))]
+    pub async fn subscribe(
+        &self,
+        queue_name: &str,
+        handlers: Vec<Arc<dyn BaseMessageHandler>>,
+        handler_execution_mode: HandlerExecutionMode,
+        cancellation_token: CancellationToken,
+    ) -> Result<(), PubSubError> {
+        let queue_settings = self.queue_settings("subscribe")?;
+
+        let queue = {
+            let queues = self
+                .queues
+                .read()
+                .map_err(|_| PubSubError::LockPoisoned { resource: "queues" })?;
+            queues
+                .get(queue_name)
+                .cloned()
+                .ok_or_else(|| PubSubError::QueueNotExists(queue_name.to_string()))?
+        };
+
+        if !queue.try_subscribe() {
+            tracing::error!("Queue already subscribed");
+            return Err(PubSubError::QueueAlreadySubscribed(queue_name.to_string()));
+        }
+
+        let sns_arn = queue.sns_arn().to_string();
+        let sqs_arn = queue.arn().to_string();
+        let sqs_url = queue.url().to_string();
+
+        if let Err(e) = self.ensure_subscription(&sns_arn, &sqs_arn).await {
+            tracing::error!(source = %e, "Error ensuring SNS subscription");
+            queue.unsubscribe();
+            return Err(e);
+        }
+
+        let stream = self.poll_sqs_stream(&sqs_url, queue_settings);
+
+        tokio::pin!(stream);
+
+        let mut loop_result: Result<(), PubSubError> = Ok(());
+
+        loop {
+            tokio::select! {
+                _ = cancellation_token.cancelled() => {
+                    tracing::info!("Subscription ended for the topic");
+                    break;
+                }
+                maybe_msg = stream.next() => {
+                    match maybe_msg {
+                        Some(Ok(msg)) => {
+                            tracing::info!("Got new message");
+                            let msg = Arc::new(msg);
+                            let mut join_set: JoinSet<Result<(), HandlerError>> = JoinSet::new();
+                            let mut name_by_id: HashMap<tokio::task::Id, &'static str> =
+                                HashMap::new();
+                            let mut cancelled = false;
+                            let mut handler_iter = handlers.iter();
+
+                            let initial_count = match handler_execution_mode {
+                                HandlerExecutionMode::Sequential => 1,
+                                HandlerExecutionMode::Parallel => handlers.len(),
+                            };
+                            for _ in 0..initial_count {
+                                if let Some(handler) = handler_iter.next() {
+                                    let h = handler.clone();
+                                    let m = msg.clone();
+                                    let name = h.handler_name();
+                                    let abort_handle = join_set
+                                        .spawn(async move { h.handle(&m).await });
+                                    name_by_id.insert(abort_handle.id(), name);
+                                }
+                            }
+
+                            while !join_set.is_empty() {
+                                let join_result = tokio::select! {
+                                    biased;
+                                    _ = cancellation_token.cancelled() => {
+                                        join_set.shutdown().await;
+                                        cancelled = true;
+                                        break;
+                                    }
+                                    r = join_set.join_next() => r.expect("non-empty join set"),
+                                };
+
+                                match join_result {
+                                    Ok(Ok(())) => {}
+                                    Ok(Err(HandlerError::ProcessedAlready { message, handler })) => {
+                                        tracing::warn!(msg_len = message.len(), handler = %handler, "Skipped the message in handler");
+                                    }
+                                    Ok(Err(HandlerError::ProcessingMessage { message, handler, source })) => {
+                                        tracing::error!(msg_len = message.len(), handler = %handler, source = %source, "Failed to process the message in the handler");
+                                    }
+                                    Err(join_err) => {
+                                        let handler_name = name_by_id
+                                            .get(&join_err.id())
+                                            .copied()
+                                            .unwrap_or("<unknown>");
+                                        if join_err.is_panic() {
+                                            tracing::error!(handler = handler_name, "Handler panicked; treating message as not handled");
+                                        } else if join_err.is_cancelled() {
+                                            tracing::warn!(handler = handler_name, "Handler aborted");
+                                        } else {
+                                            tracing::error!(handler = handler_name, error = %join_err, "Handler task failed");
+                                        }
+                                    }
+                                }
+
+                                if matches!(handler_execution_mode, HandlerExecutionMode::Sequential) {
+                                    if let Some(handler) = handler_iter.next() {
+                                        let h = handler.clone();
+                                        let m = msg.clone();
+                                        let name = h.handler_name();
+                                        let abort_handle = join_set
+                                            .spawn(async move { h.handle(&m).await });
+                                        name_by_id.insert(abort_handle.id(), name);
+                                    }
+                                }
+                            }
+
+                            if cancelled {
+                                tracing::info!("Cancelled during message processing");
+                                break;
+                            }
+                        }
+                        Some(Err(PubSubError::PollingQueue { queue, source })) => {
+                            tracing::error!(%queue, source = %source, "Polling queue retries exhausted; will retry on next poll");
+                        }
+                        Some(Err(err)) => {
+                            tracing::error!(error = %err, "Unexpected error from poll stream");
+                        }
+                        None => {
+                            loop_result = Err(PubSubError::UnexpectedCompletion(sqs_url.clone()));
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+
+        queue.unsubscribe();
+
+        loop_result
     }
 
     fn poll_sqs_stream(
