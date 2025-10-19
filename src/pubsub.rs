@@ -3,6 +3,7 @@ use crate::errors::PubSubError;
 use crate::models::BaseMessageHandler;
 use crate::models::HandlerExecutionMode;
 use crate::models::IncomingMessage;
+use crate::models::MessageDeleteMode;
 use crate::models::Queue;
 use crate::models::ResourceName;
 use crate::models::SnsTopicAttribute;
@@ -374,6 +375,7 @@ impl PubSub {
         queue_name: &str,
         handlers: Vec<Arc<dyn BaseMessageHandler>>,
         handler_execution_mode: HandlerExecutionMode,
+        delete_mode: MessageDeleteMode,
         cancellation_token: CancellationToken,
     ) -> Result<(), PubSubError> {
         let queue_settings = self.queue_settings("subscribe")?;
@@ -420,6 +422,7 @@ impl PubSub {
                     match maybe_msg {
                         Some(Ok(msg)) => {
                             tracing::info!("Got new message");
+                            let mut all_handled = true;
                             let msg = Arc::new(msg);
                             let mut join_set: JoinSet<Result<(), HandlerError>> = JoinSet::new();
                             let mut name_by_id: HashMap<tokio::task::Id, &'static str> =
@@ -459,9 +462,11 @@ impl PubSub {
                                         tracing::warn!(msg_len = message.len(), handler = %handler, "Skipped the message in handler");
                                     }
                                     Ok(Err(HandlerError::ProcessingMessage { message, handler, source })) => {
+                                        all_handled = false;
                                         tracing::error!(msg_len = message.len(), handler = %handler, source = %source, "Failed to process the message in the handler");
                                     }
                                     Err(join_err) => {
+                                        all_handled = false;
                                         let handler_name = name_by_id
                                             .get(&join_err.id())
                                             .copied()
@@ -489,8 +494,22 @@ impl PubSub {
                             }
 
                             if cancelled {
-                                tracing::info!("Cancelled during message processing");
+                                tracing::info!("Cancelled during message processing; skipping delete");
                                 break;
+                            }
+
+                            if delete_mode == MessageDeleteMode::DeleteAllCalled
+                                || (delete_mode == MessageDeleteMode::DeleteAllHandled && all_handled)
+                            {
+                                if let Err(e) = msg.delete(&self.sqs_client, &sqs_url).await {
+                                    tracing::error!(
+                                        error = %e,
+                                        queue = %sqs_url,
+                                        "Failed to delete message; will redeliver after visibility timeout"
+                                    );
+                                } else {
+                                    tracing::info!(msg_len = msg.body().len(), "Message deleted");
+                                }
                             }
                         }
                         Some(Err(PubSubError::PollingQueue { queue, source })) => {
