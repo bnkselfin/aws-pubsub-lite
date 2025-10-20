@@ -612,4 +612,30 @@ impl PubSub {
             })?
             .clone())
     }
+
+    pub fn set_queue_settings(
+        &self,
+        queue_settings: Option<QueueSettings>,
+    ) -> Result<(), PubSubError> {
+        *self
+            .queue_settings
+            .lock()
+            .map_err(|_| PubSubError::LockPoisoned {
+                resource: "queue_settings",
+            })? = queue_settings;
+        Ok(())
+    }
+
+    pub fn set_topic_settings(
+        &self,
+        topic_settings: Option<TopicSettings>,
+    ) -> Result<(), PubSubError> {
+        *self
+            .topic_settings
+            .lock()
+            .map_err(|_| PubSubError::LockPoisoned {
+                resource: "topic_settings",
+            })? = topic_settings;
+        Ok(())
+    }
 }
