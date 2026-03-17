@@ -1,9 +1,11 @@
 mod backoff_function;
 mod base_message_handler;
+mod dlq_handle;
 mod handler_execution_mode;
-mod incoming_message;
 mod message_delete_mode;
+mod incoming_message;
 mod queue;
+mod queue_dlq;
 mod resource_name;
 mod resource_naming_options;
 mod resource_types;
@@ -13,10 +15,12 @@ mod topic;
 
 pub use backoff_function::BackoffFunction;
 pub use base_message_handler::BaseMessageHandler;
+pub use dlq_handle::DlqHandle;
 pub use handler_execution_mode::HandlerExecutionMode;
-pub use incoming_message::IncomingMessage;
 pub use message_delete_mode::MessageDeleteMode;
+pub use incoming_message::IncomingMessage;
 pub use queue::Queue;
+pub use queue_dlq::QueueDlq;
 pub use resource_name::ResourceName;
 pub use resource_naming_options::ResourceNamingOptions;
 pub use resource_types::ResourceType;
