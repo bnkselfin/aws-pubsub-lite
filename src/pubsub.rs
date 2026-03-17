@@ -1,10 +1,12 @@
 use crate::errors::HandlerError;
 use crate::errors::PubSubError;
 use crate::models::BaseMessageHandler;
+use crate::models::DlqHandle;
 use crate::models::HandlerExecutionMode;
 use crate::models::IncomingMessage;
 use crate::models::MessageDeleteMode;
 use crate::models::Queue;
+use crate::models::QueueDlq;
 use crate::models::ResourceName;
 use crate::models::SnsTopicAttribute;
 use crate::models::Topic;
@@ -15,10 +17,9 @@ use aws_sdk_sqs::{Client as SqsClient, types::QueueAttributeName};
 use futures::StreamExt;
 use futures::{Stream, stream};
 use std::collections::HashMap;
-use std::sync::Arc;
 use std::sync::{Mutex, RwLock};
 use std::time::Duration;
-use std::{collections::VecDeque};
+use std::{collections::VecDeque, sync::Arc};
 use tokio::task::JoinSet;
 use tokio_retry::{Retry, strategy::ExponentialBackoff};
 use tokio_util::sync::CancellationToken;
@@ -31,6 +32,7 @@ pub struct PubSub {
     topic_settings: Mutex<Option<TopicSettings>>,
     topics: RwLock<HashMap<String, Arc<Topic>>>,
     queues: RwLock<HashMap<String, Arc<Queue>>>,
+    dlqs: RwLock<HashMap<String, Arc<DlqHandle>>>,
 }
 
 impl PubSub {
@@ -54,6 +56,7 @@ impl PubSub {
             topic_settings: Mutex::new(topic_settings),
             topics: RwLock::new(HashMap::new()),
             queues: RwLock::new(HashMap::new()),
+            dlqs: RwLock::new(HashMap::new()),
         }))
     }
 
@@ -86,6 +89,7 @@ impl PubSub {
         &self,
         name: ResourceName,
         sns_arn: &str,
+        dlq: Option<QueueDlq>,
     ) -> Result<Arc<Queue>, PubSubError> {
         let queue_name = name.to_string();
 
@@ -100,7 +104,8 @@ impl PubSub {
         }
 
         let (sqs_arn, sqs_url) = self.set_sqs(&queue_name, sns_arn).await?;
-        self.set_sqs_attributes(&sqs_arn, &sqs_url, sns_arn).await?;
+        self.set_sqs_attributes(&sqs_arn, &sqs_url, sns_arn, dlq.as_ref())
+            .await?;
 
         let queue = Arc::new(Queue::new(name, &sqs_arn, sqs_url, sns_arn)?);
 
@@ -109,6 +114,220 @@ impl PubSub {
             .write()
             .map_err(|_| PubSubError::LockPoisoned { resource: "queues" })?;
         Ok(queues.entry(queue_name).or_insert(queue).clone())
+    }
+
+    #[tracing::instrument(name = "PubSub::add_dlq", skip(self))]
+    pub async fn add_dlq(&self, name: ResourceName) -> Result<Arc<DlqHandle>, PubSubError> {
+        let dlq_name = name.to_string();
+
+        if let Some(existing) = self
+            .dlqs
+            .read()
+            .map_err(|_| PubSubError::LockPoisoned { resource: "dlqs" })?
+            .get(&dlq_name)
+            .cloned()
+        {
+            return Ok(existing);
+        }
+
+        tracing::info!("Creating DLQ");
+
+        let response = self
+            .sqs_client
+            .create_queue()
+            .queue_name(&dlq_name)
+            .send()
+            .await
+            .map_err(|e| {
+                tracing::error!(source = %e, "Failed to create DLQ");
+                PubSubError::DlqQueueCreation {
+                    queue: dlq_name.clone(),
+                    source: e,
+                }
+            })?;
+
+        let url = response
+            .queue_url()
+            .ok_or_else(|| PubSubError::GettingSQSQueueUrl(dlq_name.clone()))?
+            .to_string();
+
+        let arn = self
+            .sqs_client
+            .get_queue_attributes()
+            .queue_url(&url)
+            .attribute_names(QueueAttributeName::QueueArn)
+            .send()
+            .await
+            .map_err(|e| PubSubError::GettingQueueAttributes {
+                queue: dlq_name.clone(),
+                attribute: QueueAttributeName::QueueArn,
+                source: e,
+            })?
+            .attributes()
+            .ok_or_else(|| PubSubError::NoQueueAttributes(dlq_name.clone()))?
+            .get(&QueueAttributeName::QueueArn)
+            .ok_or_else(|| PubSubError::QueueArnNotFound(dlq_name.clone()))?
+            .to_string();
+
+        let queue_settings = self.queue_settings("add_dlq")?;
+        self.sqs_client
+            .set_queue_attributes()
+            .queue_url(&url)
+            .attributes(
+                QueueAttributeName::MessageRetentionPeriod,
+                Duration::from_millis(queue_settings.dlq_message_retention_ms)
+                    .as_secs()
+                    .to_string(),
+            )
+            .send()
+            .await
+            .map_err(|e| PubSubError::SettingQueueAttributes {
+                queue_arn: arn.clone(),
+                attribute: QueueAttributeName::MessageRetentionPeriod,
+                source: e,
+            })?;
+
+        let handle = Arc::new(DlqHandle::new(name, url, arn)?);
+
+        tracing::info!("DLQ created successfully");
+
+        let mut dlqs = self
+            .dlqs
+            .write()
+            .map_err(|_| PubSubError::LockPoisoned { resource: "dlqs" })?;
+        Ok(dlqs.entry(dlq_name).or_insert(handle).clone())
+    }
+
+    #[tracing::instrument(name = "PubSub::peek_dlq", skip(self))]
+    pub async fn peek_dlq(
+        &self,
+        dlq_url: &str,
+        max_messages: i32,
+        visibility_timeout_secs: i32,
+    ) -> Result<Vec<IncomingMessage>, PubSubError> {
+        let response = self
+            .sqs_client
+            .receive_message()
+            .queue_url(dlq_url)
+            .max_number_of_messages(max_messages)
+            .visibility_timeout(visibility_timeout_secs)
+            .send()
+            .await
+            .map_err(|e| PubSubError::ReceivingMessage {
+                queue_url: dlq_url.to_string(),
+                source: e,
+            })?;
+
+        let messages = response
+            .messages
+            .unwrap_or_default()
+            .into_iter()
+            .filter_map(|m| {
+                m.body
+                    .zip(m.receipt_handle)
+                    .map(|(body, receipt_handle)| IncomingMessage::new(body, receipt_handle))
+            })
+            .collect();
+
+        Ok(messages)
+    }
+
+    #[tracing::instrument(name = "PubSub::drain_dlq", skip(self))]
+    pub async fn drain_dlq(
+        &self,
+        dlq_url: &str,
+        target_url: &str,
+        max_messages: u32,
+    ) -> Result<u32, PubSubError> {
+        const BATCH_SIZE: i32 = 10;
+        const DRAIN_VISIBILITY_TIMEOUT_SECS: i32 = 30;
+
+        let mut drained: u32 = 0;
+        while drained < max_messages {
+            let remaining = max_messages - drained;
+            let batch_size = std::cmp::min(BATCH_SIZE as u32, remaining) as i32;
+
+            let response = self
+                .sqs_client
+                .receive_message()
+                .queue_url(dlq_url)
+                .max_number_of_messages(batch_size)
+                .visibility_timeout(DRAIN_VISIBILITY_TIMEOUT_SECS)
+                .send()
+                .await
+                .map_err(|e| PubSubError::ReceivingMessage {
+                    queue_url: dlq_url.to_string(),
+                    source: e,
+                })?;
+
+            let messages = response.messages.unwrap_or_default();
+            if messages.is_empty() {
+                break;
+            }
+
+            for msg in messages {
+                let (body, receipt_handle) = match msg.body.zip(msg.receipt_handle) {
+                    Some(pair) => pair,
+                    None => continue,
+                };
+
+                if let Err(e) = self
+                    .sqs_client
+                    .send_message()
+                    .queue_url(target_url)
+                    .message_body(&body)
+                    .send()
+                    .await
+                {
+                    tracing::error!(
+                        error = %e,
+                        target_url,
+                        "Failed to send drained message to target; leaving in DLQ for retry"
+                    );
+                    continue;
+                }
+
+                if let Err(e) = self
+                    .sqs_client
+                    .delete_message()
+                    .queue_url(dlq_url)
+                    .receipt_handle(&receipt_handle)
+                    .send()
+                    .await
+                {
+                    tracing::error!(
+                        error = %e,
+                        dlq_url,
+                        "Sent to target but failed to delete from DLQ; message will be re-drained next call (duplicate possible)"
+                    );
+                    continue;
+                }
+
+                drained += 1;
+            }
+        }
+
+        tracing::info!(drained, dlq_url, target_url, "Drain complete");
+        Ok(drained)
+    }
+
+    #[tracing::instrument(name = "PubSub::delete_dlq_message", skip(self))]
+    pub async fn delete_dlq_message(
+        &self,
+        dlq_url: &str,
+        receipt_handle: &str,
+    ) -> Result<(), PubSubError> {
+        self.sqs_client
+            .delete_message()
+            .queue_url(dlq_url)
+            .receipt_handle(receipt_handle)
+            .send()
+            .await
+            .map_err(|e| PubSubError::DeleteDlqMessage {
+                queue_url: dlq_url.to_string(),
+                source: e,
+            })?;
+        Ok(())
     }
 
     #[tracing::instrument(name = "PubSub::set_sns", skip(self))]
@@ -218,6 +437,7 @@ impl PubSub {
         sqs_arn: &str,
         sqs_url: &str,
         sns_arn: &str,
+        dlq: Option<&QueueDlq>,
     ) -> Result<(), PubSubError> {
         let queue_settings = self.queue_settings("add_queue")?;
         let policy = format!(
@@ -241,7 +461,8 @@ impl PubSub {
             sqs_arn, sns_arn
         );
 
-        self.sqs_client
+        let mut request = self
+            .sqs_client
             .set_queue_attributes()
             .queue_url(sqs_url)
             .attributes(
@@ -254,7 +475,14 @@ impl PubSub {
                 QueueAttributeName::VisibilityTimeout,
                 queue_settings.visibility_timeout_secs.to_string(),
             )
-            .attributes(QueueAttributeName::Policy, policy)
+            .attributes(QueueAttributeName::Policy, policy);
+
+        if let Some(dlq) = dlq {
+            let redrive_policy = dlq.queue_dlq_json();
+            request = request.attributes(QueueAttributeName::RedrivePolicy, redrive_policy);
+        }
+
+        request
             .send()
             .await
             .map_err(|e| PubSubError::SettingQueueAttributes {
@@ -363,6 +591,67 @@ impl PubSub {
 
         tracing::info!("Successfully pushed the message to the topic");
         Ok(publish_output)
+    }
+
+    fn poll_sqs_stream(
+        &self,
+        sqs_url: &str,
+        queue_settings: QueueSettings,
+    ) -> impl Stream<Item = Result<IncomingMessage, PubSubError>> {
+        stream::unfold(VecDeque::new(), move |mut buffer| {
+            let qs = queue_settings.clone();
+            async move {
+                if let Some(msg) = buffer.pop_front() {
+                    return Some((Ok(msg), buffer));
+                }
+
+                loop {
+                    let retry_strategy =
+                        ExponentialBackoff::from_millis(qs.retry_interval_ms).take(qs.retry_count);
+
+                    match Retry::spawn(retry_strategy, || async {
+                        self.sqs_client
+                            .receive_message()
+                            .queue_url(sqs_url)
+                            .max_number_of_messages(qs.max_message_count as i32)
+                            .wait_time_seconds(qs.wait_time_seconds)
+                            .send()
+                            .await
+                    })
+                    .await
+                    {
+                        Ok(resp) => {
+                            if let Some(messages) = resp.messages {
+                                let count = messages.len();
+                                tracing::debug!(count, "Messages pulled from the queue");
+                                for msg in messages {
+                                    if let Some((body, receipt_handle)) =
+                                        msg.body.zip(msg.receipt_handle)
+                                    {
+                                        let incoming_message =
+                                            IncomingMessage::new(body, receipt_handle);
+                                        buffer.push_back(incoming_message);
+                                    }
+                                }
+                            }
+
+                            if let Some(msg) = buffer.pop_front() {
+                                return Some((Ok(msg), buffer));
+                            }
+                        }
+                        Err(e) => {
+                            return Some((
+                                Err(PubSubError::PollingQueue {
+                                    queue: sqs_url.to_string(),
+                                    source: e,
+                                }),
+                                buffer,
+                            ));
+                        }
+                    }
+                }
+            }
+        })
     }
 
     #[tracing::instrument(name = "pubsub::subscribe", skip(self, queue_name, handlers, cancellation_token), fields(queue = %queue_name, subscribers = handlers
@@ -530,67 +819,6 @@ impl PubSub {
         queue.unsubscribe();
 
         loop_result
-    }
-
-    fn poll_sqs_stream(
-        &self,
-        sqs_url: &str,
-        queue_settings: QueueSettings,
-    ) -> impl Stream<Item = Result<IncomingMessage, PubSubError>> {
-        stream::unfold(VecDeque::new(), move |mut buffer| {
-            let qs = queue_settings.clone();
-            async move {
-                if let Some(msg) = buffer.pop_front() {
-                    return Some((Ok(msg), buffer));
-                }
-
-                loop {
-                    let retry_strategy =
-                        ExponentialBackoff::from_millis(qs.retry_interval_ms).take(qs.retry_count);
-
-                    match Retry::spawn(retry_strategy, || async {
-                        self.sqs_client
-                            .receive_message()
-                            .queue_url(sqs_url)
-                            .max_number_of_messages(qs.max_message_count as i32)
-                            .wait_time_seconds(qs.wait_time_seconds)
-                            .send()
-                            .await
-                    })
-                    .await
-                    {
-                        Ok(resp) => {
-                            if let Some(messages) = resp.messages {
-                                let count = messages.len();
-                                tracing::debug!(count, "Messages pulled from the queue");
-                                for msg in messages {
-                                    if let Some((body, receipt_handle)) =
-                                        msg.body.zip(msg.receipt_handle)
-                                    {
-                                        let incoming_message =
-                                            IncomingMessage::new(body, receipt_handle);
-                                        buffer.push_back(incoming_message);
-                                    }
-                                }
-                            }
-
-                            if let Some(msg) = buffer.pop_front() {
-                                return Some((Ok(msg), buffer));
-                            }
-                        }
-                        Err(e) => {
-                            return Some((
-                                Err(PubSubError::PollingQueue {
-                                    queue: sqs_url.to_string(),
-                                    source: e,
-                                }),
-                                buffer,
-                            ));
-                        }
-                    }
-                }
-            }
-        })
     }
 
     fn queue_settings(&self, context: &'static str) -> Result<QueueSettings, PubSubError> {
