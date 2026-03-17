@@ -10,6 +10,7 @@ pub struct QueueSettings {
     pub message_retention_ms: u64,
     pub wait_time_seconds: i32,
     pub visibility_timeout_secs: u32,
+    pub dlq_message_retention_ms: u64,
 }
 
 impl QueueSettings {
@@ -20,6 +21,7 @@ impl QueueSettings {
         message_retention_ms: u64,
         wait_time_seconds: i32,
         visibility_timeout_secs: u32,
+        dlq_message_retention_ms: u64,
     ) -> Self {
         Self {
             max_message_count,
@@ -28,6 +30,7 @@ impl QueueSettings {
             message_retention_ms,
             wait_time_seconds,
             visibility_timeout_secs,
+            dlq_message_retention_ms,
         }
     }
 
@@ -40,6 +43,8 @@ impl QueueSettings {
         let queue_wait_time_seconds: i32 = get_var("QUEUE_WAIT_TIME_SECONDS")?.parse()?;
         let queue_visibility_timeout_secs: u32 =
             get_var("QUEUE_VISIBILITY_TIMEOUT_SECS")?.parse()?;
+        let queue_dlq_message_retention_ms: u64 =
+            get_var("QUEUE_DLQ_MESSAGE_RETENTION_PERIOD_MS")?.parse()?;
 
         Ok(Self::new(
             queue_max_message_count,
@@ -48,6 +53,7 @@ impl QueueSettings {
             queue_message_retention_ms,
             queue_wait_time_seconds,
             queue_visibility_timeout_secs,
+            queue_dlq_message_retention_ms,
         ))
     }
 }
