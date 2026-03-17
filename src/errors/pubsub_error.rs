@@ -7,6 +7,7 @@ use aws_sdk_sqs::operation::create_queue::CreateQueueError;
 use aws_sdk_sqs::operation::delete_message::DeleteMessageError;
 use aws_sdk_sqs::operation::get_queue_attributes::GetQueueAttributesError;
 use aws_sdk_sqs::operation::receive_message::ReceiveMessageError;
+use aws_sdk_sqs::operation::send_message::SendMessageError;
 use aws_sdk_sqs::operation::set_queue_attributes::SetQueueAttributesError;
 use aws_sdk_sqs::types::QueueAttributeName;
 use thiserror::Error;
@@ -39,6 +40,12 @@ pub enum PubSubError {
     #[error("Error creating sqs queue '{queue}' for sns topic(arn) '{sns_arn}': {source}")]
     SQSQueueCreation {
         sns_arn: String,
+        queue: String,
+        #[source]
+        source: aws_sdk_sns::error::SdkError<CreateQueueError>,
+    },
+    #[error("Error creating DLQ '{queue}': {source}")]
+    DlqQueueCreation {
         queue: String,
         #[source]
         source: aws_sdk_sns::error::SdkError<CreateQueueError>,
@@ -93,6 +100,24 @@ pub enum PubSubError {
         queue_url: String,
         #[source]
         source: aws_sdk_sqs::error::SdkError<DeleteMessageError>,
+    },
+    #[error("Error deleting DLQ message in queue(url) '{queue_url}': {source}")]
+    DeleteDlqMessage {
+        queue_url: String,
+        #[source]
+        source: aws_sdk_sqs::error::SdkError<DeleteMessageError>,
+    },
+    #[error("Error receiving from queue(url) '{queue_url}': {source}")]
+    ReceivingMessage {
+        queue_url: String,
+        #[source]
+        source: aws_sdk_sqs::error::SdkError<ReceiveMessageError>,
+    },
+    #[error("Error sending message to queue(url) '{queue_url}': {source}")]
+    SendingToQueue {
+        queue_url: String,
+        #[source]
+        source: aws_sdk_sqs::error::SdkError<SendMessageError>,
     },
     #[error("Poll stream for queue '{0}' completed unexpectedly")]
     UnexpectedCompletion(String),
