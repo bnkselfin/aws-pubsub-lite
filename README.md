@@ -314,4 +314,4 @@ If any of these are blocking your use case, they're additions rather than rewrit
 
 ## License
 
-(Add your license of choice here â€” MIT / Apache-2.0 / etc.)
+Licensed under the [MIT License](./LICENSE). Copyright (c) 2026 Bunyamin Abbasov.
