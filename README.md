@@ -190,4 +190,4 @@ Rust **edition 2024** is required (Rust 1.85+).
 
 ## License
 
-Licensed under the [MIT License](./LICENSE). Copyright (c) 2026 Bunyamin Abbasov.
+Licensed under the [MIT License](./LICENSE). Copyright (c) 2026 bnkselfin.
