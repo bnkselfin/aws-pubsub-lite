@@ -30,9 +30,9 @@ impl AwsSettings {
     }
 
     pub fn from_env() -> Result<Self> {
-        let access_key_id = get_var("AWS_ACCESS_KEY_ID")?;
-        let secret_access_key = get_var("AWS_SECRET_ACCESS_KEY")?;
-        let region = get_var("AWS_REGION")?;
+        let access_key_id = get_var("PUBSUB_AWS_ACCESS_KEY_ID")?;
+        let secret_access_key = get_var("PUBSUB_AWS_SECRET_ACCESS_KEY")?;
+        let region = get_var("PUBSUB_AWS_REGION")?;
 
         Ok(Self::new(&region, &access_key_id, &secret_access_key))
     }

@@ -37,13 +37,13 @@ impl TopicSettings {
     }
 
     pub fn from_env() -> Result<Self> {
-        let min_delay_target_secs: u32 = get_var("TOPIC_MIN_DELAY_TARGET_SECS")?.parse()?;
-        let max_delay_target_secs: u32 = get_var("TOPIC_MAX_DELAY_TARGET_SECS")?.parse()?;
-        let num_retries: u32 = get_var("TOPIC_NUM_RETRIES")?.parse()?;
-        let num_max_delay_retries: u32 = get_var("TOPIC_NUM_MAX_DELAY_RETRIES")?.parse()?;
-        let num_no_delay_retries: u32 = get_var("TOPIC_NUM_NO_DELAY_RETRIES")?.parse()?;
-        let num_min_delay_retries: u32 = get_var("TOPIC_NUM_MIN_DELAY_RETRIES")?.parse()?;
-        let backoff_function: BackoffFunction = get_var("TOPIC_BACKOFF_FUNCTION")?.parse()?;
+        let min_delay_target_secs: u32 = get_var("PUBSUB_TOPIC_MIN_DELAY_TARGET_SECS")?.parse()?;
+        let max_delay_target_secs: u32 = get_var("PUBSUB_TOPIC_MAX_DELAY_TARGET_SECS")?.parse()?;
+        let num_retries: u32 = get_var("PUBSUB_TOPIC_NUM_RETRIES")?.parse()?;
+        let num_max_delay_retries: u32 = get_var("PUBSUB_TOPIC_NUM_MAX_DELAY_RETRIES")?.parse()?;
+        let num_no_delay_retries: u32 = get_var("PUBSUB_TOPIC_NUM_NO_DELAY_RETRIES")?.parse()?;
+        let num_min_delay_retries: u32 = get_var("PUBSUB_TOPIC_NUM_MIN_DELAY_RETRIES")?.parse()?;
+        let backoff_function: BackoffFunction = get_var("PUBSUB_TOPIC_BACKOFF_FUNCTION")?.parse()?;
 
         Ok(Self::new(
             min_delay_target_secs,
